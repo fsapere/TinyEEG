@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Debugging files
+envcheck.py
+
+# Custom project files
+MNE-bnci-data/
+eegnet_best.pth
