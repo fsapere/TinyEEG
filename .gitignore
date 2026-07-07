@@ -222,5 +222,6 @@ envcheck.py
 
 # Custom project files
 MNE-bnci-data/
-eegnet_best.pth
-models/conformer_best.pth
+*.pth
+*.onnx
+*.csv
