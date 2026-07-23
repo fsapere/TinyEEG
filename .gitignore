@@ -225,3 +225,33 @@ MNE-bnci-data/
 *.pth
 *.onnx
 *.csv
+
+# Tmp and txt
+1
+*.txt
+*.csv
+__pycache__/
+
+# ARES outputs and models
+ares_artifacts/
+network_info.json
+*.onnx
+
+# Logs and results
+hardware_logs/
+plots/
+
+# Debugging/patching scripts
+patch_*.py
+test_dw*.py
+test_conv1_y1.py
+test_dense_overflow.py
+test_export.py
+debug_*.py
+fix_bias.py
+envcheck.py
+run_make.sh
+
+# Simulators and pdks
+gvsoc/
+Siracusa_PDK/

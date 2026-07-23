@@ -44,7 +44,7 @@ class QuantizedEEGNet(nn.Module):
         )
         self.bn2 = nn.BatchNorm2d(F1 * D)
         
-        self.elu1 = nn.ELU()
+        self.relu1 = qnn.QuantReLU(act_quant=Int8ActPerTensorFloat, return_quant_tensor=True)
         self.avg_pool1 = nn.AvgPool2d((1, 4))
         self.dropout1 = nn.Dropout(p=0.5)
         
@@ -62,7 +62,7 @@ class QuantizedEEGNet(nn.Module):
         )
         self.bn3 = nn.BatchNorm2d(F2)
         
-        self.elu2 = nn.ELU()
+        self.relu2 = qnn.QuantReLU(act_quant=Int8ActPerTensorFloat, return_quant_tensor=True)
         self.avg_pool2 = nn.AvgPool2d((1, 8))
         self.dropout2 = nn.Dropout(p=0.5)
         
@@ -79,16 +79,16 @@ class QuantizedEEGNet(nn.Module):
         )
 
     def forward(self, x):
-        if len(x.shape) == 3:
-            x = x.unsqueeze(1)
-            
+        # Unconditionally unsqueeze to add the channel dimension (1)
+        x = x.unsqueeze(1)
+        
         x = self.conv1(x)
         x = self.bn1(x)
         
         x = self.depthwise_conv(x)
         x = self.bn2(x)
         
-        x = self.elu1(x)
+        x = self.relu1(x)
         x = self.avg_pool1(x)
         x = self.dropout1(x)
         
@@ -96,9 +96,12 @@ class QuantizedEEGNet(nn.Module):
         x = self.sep_pointwise(x)
         x = self.bn3(x)
         
-        x = self.elu2(x)
+        x = self.relu2(x)
         x = self.avg_pool2(x)
         x = self.dropout2(x)
+        
+        # x is a QuantTensor because return_quant_tensor=True in relu2
+        x = x.value
         
         x = self.flatten(x)
         x = self.dense(x)
@@ -134,7 +137,7 @@ class QuantizedEEGConformer(nn.Module):
         )
         
         self.batch_norm = nn.BatchNorm2d(40)
-        self.elu = nn.ELU()
+        self.relu = qnn.QuantReLU(act_quant=Int8ActPerTensorFloat, return_quant_tensor=True)
         
         self.avg_pool = nn.AvgPool2d(
             kernel_size=(1, 75), 
@@ -166,7 +169,7 @@ class QuantizedEEGConformer(nn.Module):
             input_quant=Int8ActPerTensorFloat,
             bias_quant=Int32Bias
         )
-        self.fc1_act = nn.ELU()
+        self.fc1_act = qnn.QuantReLU(act_quant=Int8ActPerTensorFloat, return_quant_tensor=True)
         self.fc2 = qnn.QuantLinear(
             64, n_outputs, bias=True,
             weight_quant=LearnedIntWeightPerChannelFloat,
@@ -175,17 +178,19 @@ class QuantizedEEGConformer(nn.Module):
         )
 
     def forward(self, x):
-        if len(x.shape) == 3:
-            x = x.unsqueeze(1)
+        # Unconditionally unsqueeze to add the channel dimension (1)
+        x = x.unsqueeze(1)
             
         # Convolution Module Forward
         x = self.temporal_conv(x)
         x = self.spatial_conv(x)
         x = self.batch_norm(x)
-        x = self.elu(x)
+        x = self.relu(x)
         x = self.avg_pool(x)
         
         # Rearrange
+        if hasattr(x, 'value'):
+            x = x.value
         x = x.squeeze(2)          
         x = x.transpose(1, 2)     
         
@@ -424,10 +429,28 @@ def main():
     # Move model to CPU for ONNX export (standard safety procedure)
     eegnet_model.to('cpu')
     
-    dummy_input = torch.randn(1, 1, n_chans, n_times)
+    # Dummy input must be 3D (batch, channels, time) since forward() unsqueezes it
+    dummy_input = torch.randn(1, n_chans, n_times)
     onnx_export_path = '/scratch/fsapere/TinyEEG/models/eegnet_int8.onnx'
     
     try:
+        print("Manually folding BatchNorm into QuantConv2d...")
+        def fuse_bn(conv, bn):
+            gamma = bn.weight.data
+            std = torch.sqrt(bn.running_var + bn.eps)
+            scale = gamma / std
+            conv.weight.data = conv.weight.data * scale.view(-1, 1, 1, 1)
+            b = conv.bias.data if conv.bias is not None else torch.zeros(conv.out_channels, device=conv.weight.device)
+            if conv.bias is None:
+                conv.bias = torch.nn.Parameter((b - bn.running_mean) * scale + bn.bias.data)
+            else:
+                conv.bias.data = (b - bn.running_mean) * scale + bn.bias.data
+            return torch.nn.Identity()
+
+        eegnet_model.bn1 = fuse_bn(eegnet_model.conv1, eegnet_model.bn1)
+        eegnet_model.bn2 = fuse_bn(eegnet_model.depthwise_conv, eegnet_model.bn2)
+        eegnet_model.bn3 = fuse_bn(eegnet_model.sep_pointwise, eegnet_model.bn3)
+        
         print(f"Exporting model to {onnx_export_path}...")
         export_onnx_qcdq(
             eegnet_model,
@@ -438,6 +461,8 @@ def main():
         print("[*] ONNX export completed successfully!")
     except Exception as e:
         print(f"[!] ONNX export failed: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 

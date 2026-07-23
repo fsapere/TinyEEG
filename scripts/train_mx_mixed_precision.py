@@ -106,6 +106,42 @@ class MXEEGNet(nn.Module):
 
 
 # ==========================================
+class MXTransformerEncoderLayer(nn.Module):
+    def __init__(self, d_model=40, nhead=10, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        self.self_attn = qnn.QuantMultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True,
+            in_proj_weight_quant=MXFloat4e2m1Weight,
+            in_proj_act_quant=MXFloat8e4m3Act,
+            out_proj_weight_quant=MXFloat4e2m1Weight,
+            out_proj_act_quant=MXFloat8e4m3Act,
+            return_quant_tensor=True
+        )
+        self.linear1 = qnn.QuantLinear(d_model, dim_feedforward, weight_quant=MXFloat4e2m1Weight, input_quant=MXFloat8e4m3Act)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = qnn.QuantLinear(dim_feedforward, d_model, weight_quant=MXFloat4e2m1Weight, input_quant=MXFloat8e4m3Act)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.activation = qnn.QuantReLU(act_quant=MXFloat8e4m3Act, return_quant_tensor=True)
+
+    def forward(self, src):
+        src2 = self.self_attn(src, src, src, need_weights=False)[0]
+        if hasattr(src2, 'value'):
+            src2 = src2.value
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        if hasattr(src2, 'value'):
+            src2 = src2.value
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src
+
 # 2. QUANTIZED EEG CONFORMER ARCHITECTURE (MX)
 # ==========================================
 class MXEEGConformer(nn.Module):
@@ -134,7 +170,7 @@ class MXEEGConformer(nn.Module):
         )
         
         self.batch_norm = nn.BatchNorm2d(40)
-        self.elu = nn.ELU()
+        self.elu = qnn.QuantReLU(act_quant=MXFloat8e4m3Act, return_quant_tensor=True)
         
         self.avg_pool = nn.AvgPool2d(
             kernel_size=(1, 75), 
@@ -149,13 +185,8 @@ class MXEEGConformer(nn.Module):
             x = self.avg_pool(x)
             self.seq_len = x.shape[-1]
             
-        # --- Self-Attention Module (FP32) ---
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=40, 
-            nhead=10, 
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=6)
+        # --- Self-Attention Module (MX Quantized) ---
+        self.transformer = nn.Sequential(*[MXTransformerEncoderLayer(d_model=40, nhead=10) for _ in range(6)])
         
         # --- Classifier Module ---
         self.flatten = nn.Flatten()
@@ -165,7 +196,7 @@ class MXEEGConformer(nn.Module):
             weight_quant=MXFloat4e2m1Weight,
             input_quant=MXFloat8e4m3Act
         )
-        self.fc1_act = nn.ELU()
+        self.fc1_act = qnn.QuantReLU(act_quant=MXFloat8e4m3Act, return_quant_tensor=True)
         self.fc2 = qnn.QuantLinear(
             64, n_outputs, bias=True,
             weight_quant=MXFloat4e2m1Weight,
@@ -184,6 +215,8 @@ class MXEEGConformer(nn.Module):
         x = self.avg_pool(x)
         
         # Rearrange
+        if hasattr(x, 'value'):
+            x = x.value
         x = x.squeeze(2)          
         x = x.transpose(1, 2)     
         
